@@ -1,11 +1,15 @@
 import React, { useEffect, useState } from 'react';
-import { Button, Form, Row, Col, FormCheck } from 'react-bootstrap';
+import { Button, Form, Row, FormCheck } from 'react-bootstrap';
 import { Formik, useFormikContext } from 'formik';
 import * as yup from 'yup';
 import FormControl from '../Components/FormControl';
 import FormSelect from '../Components/FormSelect';
 import Section from '../Components/Section';
 import WebApi from '../Services/WebApi';
+import JSEncrypt from 'jsencrypt';
+import CryptoJS from 'crypto-js';
+import get from 'lodash/get'
+import set from "lodash/set"
 
 const I2C_BLOCKS = [
 	{ label: 'i2c0', value: 0 },
@@ -56,10 +60,10 @@ const BUTTON_MASKS = [
 	{ label: 'R3',    value:  (1 << 11)  },
 	{ label: 'A1',    value:  (1 << 12)  },
 	{ label: 'A2',    value:  (1 << 13)  },
-	{ label: 'Up',    value:  (1 << 14)  },
-	{ label: 'Down',  value:  (1 << 15)  },
-	{ label: 'Left',  value:  (1 << 16)  },
-	{ label: 'Right', value:  (1 << 17)  },
+	{ label: 'Up',    value:  (1 << 16)  },
+	{ label: 'Down',  value:  (1 << 17)  },
+	{ label: 'Left',  value:  (1 << 18)  },
+	{ label: 'Right', value:  (1 << 19)  },
 ];
 
 const TURBO_MASKS = [
@@ -82,71 +86,288 @@ const REVERSE_ACTION = [
 	{ label: 'Neutral', value: 2 },
 ];
 
+const verifyAndSavePS4 = async () => {
+	let PS4Key = document.getElementById("ps4key-input");
+	let PS4Serial = document.getElementById("ps4serial-input");
+	let PS4Signature = document.getElementById("ps4signature-input");
+
+	let count = 0;
+	var pem;
+	var signature;
+	var serial;
+
+	const handlePEM = (e) => {
+		pem = keyReader.result;
+		count++;
+	};
+
+	const handleSignature = (e) => {
+		signature = sigReader.result;
+		count++;
+	};
+
+	const handleSerial = (e) => {
+		serial = serialReader.result;
+		count++;
+	};
+
+	let keyReader = new FileReader();
+	keyReader.onloadend = handlePEM;
+	keyReader.readAsText(PS4Key.files[0]);
+
+	let serialReader = new FileReader();
+	serialReader.onloadend = handleSerial;
+	serialReader.readAsText(PS4Serial.files[0]);
+
+	let sigReader = new FileReader();
+	sigReader.onloadend = handleSignature;
+	sigReader.readAsBinaryString(PS4Signature.files[0]);
+
+	async function checkRead () {
+		if ( count < 3 ) {
+			setTimeout(checkRead, 1000);
+		} else {
+			// Make sure our signature is 256 bytes
+			if ( signature.length !== 256 || serial.length !== 16) {
+				throw new Error("Signature or serial is invalid");
+			}
+			try {
+				serial = serial.padStart(32,'0'); // Add our padding
+
+				const key = new JSEncrypt();
+				key.setPrivateKey(pem);
+				const bytes = new Uint8Array(256);
+				for(let i = 0; i < 256; i++){
+					bytes[i] = Math.random();
+				}
+				const hashed = CryptoJS.SHA256(bytes);
+				const signNonce = key.sign(hashed, CryptoJS.SHA256, "sha256");
+
+				if (signNonce === false) {
+					throw new Error("Bad Private Key");
+				}
+
+				// Private key worked!
+				var BigInteger = require('jsbn').BigInteger;
+
+				// Translate these to BigInteger
+				var N = new BigInteger(String(key.key.n));
+				var E = new BigInteger(String(key.key.e));
+				var D = new BigInteger(String(key.key.d));
+				var P = new BigInteger(String(key.key.p));
+				var Q = new BigInteger(String(key.key.q));
+				var DP = new BigInteger(String(key.key.dmp1));
+				var DQ = new BigInteger(String(key.key.dmq1));
+				var constantR = new BigInteger('2').pow(4096); 	// constant R
+				var QP = Q.modInverse(P); 						// qp = 1 / ( Q % P)
+				var RN = constantR.mod(N); 						// rn = constant R mod N
+
+				function int2mbedmpi(num) {
+					var out = [];
+					var mask = new BigInteger('4294967295');
+					var zero = new BigInteger('0');
+					while(!num.equals(zero)) {
+						out.push(num.and(mask).toString(16).padStart(8, '0'));
+						num = num.shiftRight(32);
+					}
+					return out;
+				}
+
+				function hexToBytes(hex) {
+					let bytes = [];
+					for (let c = 0; c < hex.length; c += 2)
+						bytes.push(parseInt(hex.substr(c, 2), 16));
+					return bytes;
+				}
+
+				function mbedmpi2b64(mpi) {
+					var arr = new Uint8Array(mpi.length*4);
+					var cnt = 0;
+					for ( let i = 0; i < mpi.length; i++) {
+						let bytes = hexToBytes(mpi[i]);
+						for ( let j = 4; j > 0; j--) {
+							//arr[cnt] = bytes[j];
+							// TEST: re-order from LSB to MSB
+							arr[cnt] = bytes[j-1];
+							cnt++;
+						}
+					}
+
+					return btoa(String.fromCharCode.apply(null, arr));
+				}
+
+				const sendPS4Chunks = async (chunks) => {
+					for ( var i in chunks ) {
+						if (await WebApi.setPS4Options(chunks[i]) === false ) {
+							return false;
+						}
+					}
+					return true;
+				};
+
+
+				let serialBin = hexToBytes(serial);
+
+				let success = await sendPS4Chunks([{
+					N: mbedmpi2b64(int2mbedmpi(N)),
+					E: mbedmpi2b64(int2mbedmpi(E)),
+					D: mbedmpi2b64(int2mbedmpi(D))
+				}, {
+					P: mbedmpi2b64(int2mbedmpi(P)),
+					Q: mbedmpi2b64(int2mbedmpi(Q)),
+					DP: mbedmpi2b64(int2mbedmpi(DP)),
+					DQ: mbedmpi2b64(int2mbedmpi(DQ))
+				}, {
+					QP: mbedmpi2b64(int2mbedmpi(QP)),
+					RN: mbedmpi2b64(int2mbedmpi(RN)),
+					serial: btoa(String.fromCharCode(...new Uint8Array(serialBin)))
+				}, {
+					signature: btoa(signature)
+				}]);
+
+				if ( success ) {
+					document.getElementById("ps4alert").textContent = 'Verified and Saved PS4 Mode! Reboot to take effect';
+					document.getElementById("save").click();
+				} else {
+					throw Error("PS4 Chunks Error");
+				}
+
+			} catch (e) {
+				document.getElementById("ps4alert").textContent = 'ERROR: Could not verify required files';
+			}
+		}
+	};
+	setTimeout(checkRead, 1000);
+};
+
+const SOCD_MODES = [
+	{ label: 'Up Priority', value: 0 },
+	{ label: 'Neutral', value: 1 },
+	{ label: 'Last Win', value: 2 },
+	{ label: 'First Win', value: 3 },
+	{ label: 'SOCD Cleaning Off', value: 4 },
+];
+
+yup.NumberSchema.prototype.validateSelectionWhenEnabled = function(name, choices) {
+	return this.when(name, {
+		is: value => !!value,
+		then: () => this.required().oneOf(choices.map(o => o.value)),
+		otherwise: () => yup.mixed().notRequired()
+	})
+};
+
+yup.NumberSchema.prototype.validateNumberWhenEnabled = function(name) {
+	return this.when(name, {
+		is: value => !!value,
+		then: () => this.required(),
+		otherwise: () => yup.mixed().notRequired().strip()
+	})
+};
+
+yup.NumberSchema.prototype.validateRangeWhenEnabled = function(name, min, max) {
+	return this.when(name, {
+		is: value =>!!value,
+		then: () => this.required().min(min).max(max),
+		otherwise: () => yup.mixed().notRequired().strip()
+	})
+};
+
+yup.NumberSchema.prototype.validatePinWhenEnabled = function(name) {
+	return this.checkUsedPins().validateRangeWhenEnabled(name, -1, 29)
+};
+
+yup.NumberSchema.prototype.checkUsedPins = function() {
+	return this.test('', '${originalValue} is unavailable/already assigned!', (value) => usedPins.indexOf(value) === -1)
+};
+
 const schema = yup.object().shape({
-	turboPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Turbo Pin'),
-	turboPinLED: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Turbo Pin LED'),
-	sliderLSPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Slider LS Pin'),
-	sliderRSPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Slider RS Pin'),
-	sliderSOCDUpPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Slider SOCD Up Priority Pin'),
-	sliderSOCDSecondPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Slider SOCD Second Priority Pin'),
-	turboShotCount: yup.number().required().min(5).max(30).label('Turbo Shot Count'),
-	reversePin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Reverse Pin'),
-	reversePinLED: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Reverse Pin LED'),
-	i2cAnalog1219SDAPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('I2C Analog1219 SDA Pin'),
-	i2cAnalog1219SCLPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('I2C Analog1219 SCL Pin'),
-	i2cAnalog1219Block: yup.number().required().oneOf(I2C_BLOCKS.map(o => o.value)).label('I2C Analog1219 Block'),
-	i2cAnalog1219Speed: yup.number().required().label('I2C Analog1219 Speed'),
-	i2cAnalog1219Address: yup.number().required().label('I2C Analog1219 Address'),
-	i2cInputExpansionSDAPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('I2C Input Expansion SDA Pin'),
-	i2cInputExpansionSCLPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('I2C Input Expansion SCL Pin'),
-	i2cInputExpansionBlock: yup.number().required().oneOf(I2C_BLOCKS.map(o => o.value)).label('I2C Input Expansion Block'),
-	i2cInputExpansionSpeed: yup.number().required().label('I2C Input Expansion Speed'),
-	i2cInputExpansionAddress: yup.number().required().label('I2C Input Expansion Address'),
-	i2cInputExpansionAnalogMap: yup.string().optional().label('I2C Input Expansion Analog Map'),
+	I2CAnalog1219InputEnabled:   yup.number().label('I2C Analog1219 Input Enabled'),
+	i2cAnalog1219SDAPin:         yup.number().label('I2C Analog1219 SDA Pin').validatePinWhenEnabled('I2CAnalog1219InputEnabled'),
+	i2cAnalog1219SCLPin:         yup.number().label('I2C Analog1219 SCL Pin').validatePinWhenEnabled('I2CAnalog1219InputEnabled'),
+	i2cAnalog1219Block:          yup.number().label('I2C Analog1219 Block').validateSelectionWhenEnabled('I2CAnalog1219InputEnabled', I2C_BLOCKS),
+	i2cAnalog1219Speed:          yup.number().label('I2C Analog1219 Speed').validateNumberWhenEnabled('I2CAnalog1219InputEnabled'),
+	i2cAnalog1219Address:        yup.number().label('I2C Analog1219 Address').validateNumberWhenEnabled('I2CAnalog1219InputEnabled'),
+
+	I2CInputExpansionEnabled:    yup.number().label('I2C Input Expansion Input Enabled'),
+    i2cInputExpansionSDAPin:     yup.number().label('I2C Input Expansion SDA Pin').validatePinWhenEnabled('I2CInputExpansionEnabled'),
+	i2cInputExpansionSCLPin:     yup.number().label('I2C Input Expansion SCL Pin').validatePinWhenEnabled('I2CInputExpansionEnabled'),
+	i2cInputExpansionBlock:      yup.number().label('I2C Input Expansion Block').validateSelectionWhenEnabled('I2CInputExpansionEnabled', I2C_BLOCKS),
+	i2cInputExpansionSpeed:      yup.number().required().label('I2C Input Expansion Speed').validateNumberWhenEnabled('I2CInputExpansionEnabled'),
+	i2cInputExpansionAddress:    yup.number().required().label('I2C Input Expansion Address').validateNumberWhenEnabled('I2CInputExpansionEnabled'),
+	i2cInputExpansionAnalogMap:  yup.string().optional().label('I2C Input Expansion Analog Map'),
 	i2cInputExpansionDigitalMap: yup.string().optional().label('I2C Input Expansion Digital Map'),
-	onBoardLedMode: yup.number().required().oneOf(ON_BOARD_LED_MODES.map(o => o.value)).label('On-Board LED Mode'),
-	dualDirUpPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Dual Directional Up Pin'),
-	dualDirDownPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Dual Directional Down Pin'),
-	dualDirLeftPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Dual Directional Left Pin'),
-	dualDirRightPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Dual Directional Right Pin'),
-	dualDirDpadMode : yup.number().required().oneOf(DUAL_STICK_MODES.map(o => o.value)).label('Dual Stick Mode'),
-	dualDirCombineMode : yup.number().required().oneOf(DUAL_COMBINE_MODES.map(o => o.value)).label('Dual Combination Mode'),
-	analogAdcPinX : yup.number().required().test('', '${originalValue} is unavailable/already assigned!', (value) => usedPins.indexOf(value) === -1).label('Analog Stick Pin X'),
- 	analogAdcPinY : yup.number().required().test('', '${originalValue} is unavailable/already assigned!', (value) => usedPins.indexOf(value) === -1).label('Analog Stick Pin Y'),
-	bootselButtonMap : yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('BOOTSEL Button Map'),
-	buzzerPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Buzzer Pin'),
-	buzzerVolume: yup.number().required().min(0).max(100).label('Buzzer Volume'),
-	extraButtonPin: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Extra Button Pin'),
-	extraButtonMap : yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Extra Button Map'),
-	playerNumber: yup.number().required().min(1).max(4).label('Player Number'),
-	shmupMode: yup.number().required().label('Shmup Mode Enabled'),
-	shmupMixMode: yup.number().required().oneOf(DUAL_STICK_MODES.map(o => o.value)).label('Shmup Mix Priority'),
-	shmupAlwaysOn1: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Turbo-Button 1 (Always On)'),
-	shmupAlwaysOn2: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Turbo-Button 2 (Always On)'),
-	shmupAlwaysOn3: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Turbo-Button 3 (Always On)'),
-	shmupAlwaysOn4: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Turbo-Button 4 (Always On)'),
-	pinShmupBtn1: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Charge Shot 1 Pin'),
-	pinShmupBtn2: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Charge Shot 2 Pin'),
-	pinShmupBtn3: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Charge Shot 3 Pin'),
-	pinShmupBtn4: yup.number().required().min(-1).max(29).test('', '${originalValue} is already assigned!', (value) => usedPins.indexOf(value) === -1).label('Charge Shot 4 Pin'),
-	shmupBtnMask1: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Charge Shot Button 1 Map'),
-	shmupBtnMask2: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Charge Shot Button 2 Map'),
-	shmupBtnMask3: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Charge Shot Button 3 Map'),
-	shmupBtnMask4: yup.number().required().oneOf(BUTTON_MASKS.map(o => o.value)).label('Charge Shot Button 4 Map'),
-	pinShmupDial: yup.number().required().test('', '${originalValue} is unavailable/already assigned!', (value) => usedPins.indexOf(value) === -1).label('Shmup Dial Pin'),
-	AnalogInputEnabled: yup.number().required().label('Analog Input Enabled'),
-	BoardLedAddonEnabled: yup.number().required().label('Board LED Add-On Enabled'),
-	BuzzerSpeakerAddonEnabled: yup.number().required().label('Buzzer Speaker Add-On Enabled'),
-	BootselButtonAddonEnabled: yup.number().required().label('Boot Select Button Add-On Enabled'),
+
+	AnalogInputEnabled:          yup.number().required().label('Analog Input Enabled'),
+	analogAdcPinX:               yup.number().label('Analog Stick Pin X').validatePinWhenEnabled('AnalogInputEnabled'),
+ 	analogAdcPinY:               yup.number().label('Analog Stick Pin Y').validatePinWhenEnabled('AnalogInputEnabled'),
+
+	BoardLedAddonEnabled:        yup.number().required().label('Board LED Add-On Enabled'),
+	onBoardLedMode:              yup.number().label('On-Board LED Mode').validateSelectionWhenEnabled('BoardLedAddonEnabled', ON_BOARD_LED_MODES),
+
+	BootselButtonAddonEnabled:   yup.number().required().label('Boot Select Button Add-On Enabled'),
+	bootselButtonMap:            yup.number().label('BOOTSEL Button Map').validateSelectionWhenEnabled('BootselButtonAddonEnabled', BUTTON_MASKS),
+
+	BuzzerSpeakerAddonEnabled:   yup.number().required().label('Buzzer Speaker Add-On Enabled'),
+	buzzerPin:                   yup.number().label('Buzzer Pin').validatePinWhenEnabled('BuzzerSpeakerAddonEnabled'),
+	buzzerVolume:                yup.number().label('Buzzer Volume').validateRangeWhenEnabled('BuzzerSpeakerAddonEnabled', 0, 100),
+
 	DualDirectionalInputEnabled: yup.number().required().label('Dual Directional Input Enabled'),
-	ExtraButtonAddonEnabled: yup.number().required().label('Extra Button Add-On Enabled'),
-	I2CAnalog1219InputEnabled: yup.number().required().label('I2C Analog1219 Input Enabled'),
-	I2CInputExpansionEnabled: yup.number().required().label('I2C Input Expansion Input Enabled'),
-	JSliderInputEnabled: yup.number().required().label('JSlider Input Enabled'),
-	SliderSOCDInputEnabled: yup.number().required().label('Slider SOCD Input Enabled'),
-	PlayerNumAddonEnabled: yup.number().required().label('Player Number Add-On Enabled'),
-	ReverseInputEnabled: yup.number().required().label('Reverse Input Enabled'),
-	TurboInputEnabled: yup.number().required().label('Turbo Input Enabled')
+	dualDirUpPin:                yup.number().label('Dual Directional Up Pin').validatePinWhenEnabled('DualDirectionalInputEnabled')  ,
+	dualDirDownPin:              yup.number().label('Dual Directional Down Pin').validatePinWhenEnabled('DualDirectionalInputEnabled'),
+	dualDirLeftPin:              yup.number().label('Dual Directional Left Pin').validatePinWhenEnabled('DualDirectionalInputEnabled'),
+	dualDirRightPin:             yup.number().label('Dual Directional Right Pin').validatePinWhenEnabled('DualDirectionalInputEnabled'),
+	dualDirDpadMode:             yup.number().label('Dual Stick Mode').validateSelectionWhenEnabled('DualDirectionalInputEnabled', DUAL_STICK_MODES),
+	dualDirCombineMode:          yup.number().label('Dual Combination Mode').validateSelectionWhenEnabled('DualDirectionalInputEnabled', DUAL_COMBINE_MODES),
+
+	ExtraButtonAddonEnabled:     yup.number().required().label('Extra Button Add-On Enabled'),
+	extraButtonPin:              yup.number().label('Extra Button Pin').validatePinWhenEnabled('ExtraButtonAddonEnabled'),
+	extraButtonMap:              yup.number().label('Extra Button Map').validateSelectionWhenEnabled('ExtraButtonAddonEnabled', BUTTON_MASKS),
+
+	JSliderInputEnabled:         yup.number().required().label('JSlider Input Enabled'),
+	sliderLSPin:                 yup.number().label('Slider LS Pin').validatePinWhenEnabled('JSliderInputEnabled'),
+	sliderRSPin:                 yup.number().label('Slider RS Pin').validatePinWhenEnabled('JSliderInputEnabled'),
+
+	PlayerNumAddonEnabled:       yup.number().required().label('Player Number Add-On Enabled'),
+	playerNumber:                yup.number().label('Player Number').validateRangeWhenEnabled('PlayerNumAddonEnabled', 1, 4),
+
+	PS4ModeAddonEnabled: yup.number().required().label('PS4 Mode Add-on Enabled'),
+
+	ReverseInputEnabled:         yup.number().required().label('Reverse Input Enabled'),
+	reversePin:                  yup.number().label('Reverse Pin').validatePinWhenEnabled('ReverseInputEnabled'),
+	reversePinLED:               yup.number().label('Reverse Pin LED').validatePinWhenEnabled('ReverseInputEnabled'),
+
+	SliderSOCDInputEnabled:      yup.number().required().label('Slider SOCD Input Enabled'),
+	sliderSOCDModeOne:           yup.number().label('SOCD Slider Mode One').validateSelectionWhenEnabled('SliderSOCDInputEnabled', SOCD_MODES),
+	sliderSOCDModeTwo:           yup.number().label('SOCD Slider Mode Two').validateSelectionWhenEnabled('SliderSOCDInputEnabled', SOCD_MODES),
+	sliderSOCDModeDefault:       yup.number().label('SOCD Slider Mode Default').validateSelectionWhenEnabled('SliderSOCDInputEnabled', SOCD_MODES),
+	sliderSOCDPinOne:            yup.number().label('Slider SOCD Up Priority Pin').validatePinWhenEnabled('SliderSOCDInputEnabled'),
+	sliderSOCDPinTwo:            yup.number().label('Slider SOCD Second Priority Pin').validatePinWhenEnabled('SliderSOCDInputEnabled'),
+
+	TurboInputEnabled:           yup.number().required().label('Turbo Input Enabled'),
+	turboPin:                    yup.number().label('Turbo Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	turboPinLED:                 yup.number().label('Turbo Pin LED').validatePinWhenEnabled('TurboInputEnabled'),
+	pinShmupBtn1:                yup.number().label('Charge Shot 1 Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	pinShmupBtn2:                yup.number().label('Charge Shot 2 Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	pinShmupBtn3:                yup.number().label('Charge Shot 3 Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	pinShmupBtn4:                yup.number().label('Charge Shot 4 Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	pinShmupDial:                yup.number().label('Shmup Dial Pin').validatePinWhenEnabled('TurboInputEnabled'),
+	turboShotCount:              yup.number().label('Turbo Shot Count').validateRangeWhenEnabled('TurboInputEnabled', 5, 30),
+	shmupMode:                   yup.number().label('Shmup Mode Enabled').validateRangeWhenEnabled('TurboInputEnabled', 0, 1),
+	shmupMixMode:                yup.number().label('Shmup Mix Priority').validateSelectionWhenEnabled('TurboInputEnabled', DUAL_STICK_MODES),
+	shmupAlwaysOn1:              yup.number().label('Turbo-Button 1 (Always On)').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupAlwaysOn2:              yup.number().label('Turbo-Button 2 (Always On)').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupAlwaysOn3:              yup.number().label('Turbo-Button 3 (Always On)').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupAlwaysOn4:              yup.number().label('Turbo-Button 4 (Always On)').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupBtnMask1:               yup.number().label('Charge Shot Button 1 Map').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupBtnMask2:               yup.number().label('Charge Shot Button 2 Map').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupBtnMask3:               yup.number().label('Charge Shot Button 3 Map').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+	shmupBtnMask4:               yup.number().label('Charge Shot Button 4 Map').validateSelectionWhenEnabled('TurboInputEnabled', BUTTON_MASKS),
+
+	WiiExtensionAddonEnabled:    yup.number().required().label('Wii Extensions Enabled'),
+	wiiExtensionSDAPin:          yup.number().required().label('WiiExtension I2C SDA Pin').validatePinWhenEnabled('WiiExtensionAddonEnabled'),
+	wiiExtensionSCLPin:          yup.number().required().label('WiiExtension I2C SCL Pin').validatePinWhenEnabled('WiiExtensionAddonEnabled'),
+	wiiExtensionBlock:           yup.number().required().label('WiiExtension I2C Block').validateSelectionWhenEnabled('WiiExtensionAddonEnabled', I2C_BLOCKS),
+	wiiExtensionSpeed:           yup.number().label('WiiExtension I2C Speed').validateNumberWhenEnabled('WiiExtensionAddonEnabled'),
 });
 
 const defaultValues = {
@@ -154,8 +375,8 @@ const defaultValues = {
 	turboPinLED: -1,
 	sliderLSPin: -1,
 	sliderRSPin: -1,
-	sliderSOCDUpPin: -1,
-	sliderSOCDSecondPin: -1,
+	sliderSOCDPinOne: -1,
+	sliderSOCDPinTwo: -1,
 	turboShotCount: 5,
 	reversePin: -1,
 	reversePinLED: -1,
@@ -201,6 +422,13 @@ const defaultValues = {
 	shmupBtnMask3: 0,
 	shmupBtnMask4: 0,
 	pinShmupDial: -1,
+	sliderSOCDModeOne: 0,
+	sliderSOCDModeTwo: 2,
+	sliderSOCDModeDefault: 1,
+	wiiExtensionSDAPin: -1,
+	wiiExtensionSCLPin: -1,
+	wiiExtensionBlock: 0,
+	wiiExtensionSpeed: 400000,
 	AnalogInputEnabled: 0,
 	BoardLedAddonEnabled: 0,
 	BuzzerSpeakerAddonEnabled: 0,
@@ -212,13 +440,15 @@ const defaultValues = {
 	JSliderInputEnabled: 0,
 	SliderSOCDInputEnabled: 0,
 	PlayerNumAddonEnabled: 0,
+	PS4ModeAddonEnabled: 0,
 	ReverseInputEnabled: 0,
-	TurboInputEnabled: 0
+	TurboInputEnabled: 0,
+	WiiExtensionAddonEnabled: 0,
 };
 
 let usedPins = [];
 
-const FormContext = () => {
+const FormContext = ({setStoredData}) => {
 	const { values, setValues } = useFormikContext();
 
 	useEffect(() => {
@@ -226,12 +456,20 @@ const FormContext = () => {
 			const data = await WebApi.getAddonsOptions();
 			usedPins = data.usedPins;
 			setValues(data);
+			setStoredData(JSON.parse(JSON.stringify(data))); // Do a deep copy to keep the original
 		}
 		fetchData();
 	}, [setValues]);
 
 	useEffect(() => {
-		if (!!values.turboPin)
+		sanitizeData(values);
+	}, [values, setValues]);
+
+	return null;
+};
+
+const sanitizeData = (values) => {
+	if (!!values.turboPin)
 			values.turboPin = parseInt(values.turboPin);
 		if (!!values.turboPinLED)
 			values.turboPinLED = parseInt(values.turboPinLED);
@@ -239,10 +477,10 @@ const FormContext = () => {
 			values.sliderLSPin = parseInt(values.sliderLSPin);
 		if (!!values.sliderRSPin)
 			values.sliderRSPin = parseInt(values.sliderRSPin);
-		if (!!values.sliderSOCDUpPin)
-			values.sliderSOCDUpPin = parseInt(values.sliderSOCDUpPin);
-		if (!!values.sliderSOCDSecondPin)
-			values.sliderSOCDSecondPin = parseInt(values.sliderSOCDSecondPin);
+		if (!!values.sliderSOCDPinOne)
+			values.sliderSOCDPinOne = parseInt(values.sliderSOCDPinOne);
+		if (!!values.sliderSOCDPinTwo)
+			values.sliderSOCDPinTwo = parseInt(values.sliderSOCDPinTwo);
 		if (!!values.turboShotCount)
 			values.turboShotCount = parseInt(values.turboShotCount);
 		if (!!values.reversePin)
@@ -335,6 +573,20 @@ const FormContext = () => {
 			values.shmupBtnMask4 = parseInt(values.shmupBtnMask4);
 		if (!!values.pinShmupDial)
 			values.pinShmupDial = parseInt(values.pinShmupDial);
+		if (!!values.sliderSOCDModeOne)
+			values.sliderSOCDModeOne = parseInt(values.sliderSOCDModeOne);
+		if (!!values.sliderSOCDModeTwo)
+			values.sliderSOCDModeTwo = parseInt(values.sliderSOCDModeTwo);
+		if (!!values.sliderSOCDModeDefault)
+			values.sliderSOCDModeDefault = parseInt(values.sliderSOCDModeDefault);
+		if (!!values.wiiExtensionSDAPin)
+			values.wiiExtensionSDAPin = parseInt(values.wiiExtensionSDAPin);
+		if (!!values.wiiExtensionSCLPin)
+			values.wiiExtensionSCLPin = parseInt(values.wiiExtensionSCLPin);
+		if (!!values.wiiExtensionBlock)
+			values.wiiExtensionBlock = parseInt(values.wiiExtensionBlock);
+		if (!!values.wiiExtensionSpeed)
+			values.wiiExtensionSpeed = parseInt(values.wiiExtensionSpeed);
 		if (!!values.AnalogInputEnabled)
 			values.AnalogInputEnabled = parseInt(values.AnalogInputEnabled);
 		if (!!values.BoardLedAddonEnabled)
@@ -357,20 +609,56 @@ const FormContext = () => {
 			values.SliderSOCDInputEnabled = parseInt(values.SliderSOCDInputEnabled);
 		if (!!values.PlayerNumAddonEnabled)
 			values.PlayerNumAddonEnabled = parseInt(values.PlayerNumAddonEnabled);
+		if (!!values.PS4ModeAddonEnabled)
+			values.PS4ModeAddonEnabled = parseInt(values.PS4ModeAddonEnabled);
 		if (!!values.ReverseInputEnabled)
 			values.ReverseInputEnabled = parseInt(values.ReverseInputEnabled);
 		if (!!values.TurboInputEnabled)
 			values.TurboInputEnabled = parseInt(values.TurboInputEnabled);
-	}, [values, setValues]);
+		if (!!values.WiiExtensionAddonEnabled)
+			values.WiiExtensionAddonEnabled = parseInt(values.WiiExtensionAddonEnabled);
+}
 
-	return null;
-};
+function flattenObject(object) {
+	var toReturn = {};
+
+	for (var i in object) {
+	  if (!object.hasOwnProperty(i)) continue;
+
+	  if (typeof object[i] == "object" && object[i] !== null) {
+		var flatObject = flattenObject(object[i]);
+		for (var x in flatObject) {
+		  if (!flatObject.hasOwnProperty(x)) continue;
+
+		  toReturn[i + "." + x] = flatObject[x];
+		}
+	  } else {
+		toReturn[i] = object[i];
+	  }
+	}
+	return toReturn;
+  }
 
 export default function AddonsConfigPage() {
 	const [saveMessage, setSaveMessage] = useState('');
+	const [storedData, setStoredData] = useState({});
 
 	const onSuccess = async (values) => {
-		const success = WebApi.setAddonsOptions(values);
+		const flattened = flattenObject(storedData)
+		const valuesCopy = schema.cast((values)) // Strip invalid values
+
+		// Compare what's changed and set it to resultObject
+		let resultObject = {}
+		Object.entries(flattened)?.map(entry => {
+			const [key, oldVal] = entry;
+			const newVal = get(valuesCopy, key)
+			if (newVal !== oldVal) {
+				set(resultObject, key, newVal)
+			}
+		})
+		sanitizeData(resultObject);
+		const success = await WebApi.setAddonsOptions(resultObject);
+		setStoredData(JSON.parse(JSON.stringify(values))); // Update to reflect saved data
 		setSaveMessage(success ? 'Saved! Please Restart Your Device' : 'Unable to Save');
 	};
 
@@ -383,9 +671,7 @@ export default function AddonsConfigPage() {
 			{({
 				handleSubmit,
 				handleChange,
-				handleBlur,
 				values,
-				touched,
 				errors,
 			}) => (
 				<Form noValidate onSubmit={handleSubmit}>
@@ -414,8 +700,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="BootselButtonAddonButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.BootselButtonAddonEnabled)}
 							onChange={(e) => { handleCheckbox("BootselButtonAddonEnabled", values); handleChange(e);}}
@@ -441,8 +726,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="BoardLedAddonButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.BoardLedAddonEnabled)}
 							onChange={(e) => {handleCheckbox("BoardLedAddonEnabled", values); handleChange(e);}}
@@ -453,7 +737,7 @@ export default function AddonsConfigPage() {
 							id="AnalogInputOptions"
 							hidden={!values.AnalogInputEnabled}>
 						<p>Available pins: {ANALOG_PINS.join(", ")}</p>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormSelect
 								label="Analog Stick X Pin"
 								name="analogAdcPinX"
@@ -484,8 +768,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="AnalogInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.AnalogInputEnabled)}
 							onChange={(e) => {handleCheckbox("AnalogInputEnabled", values); handleChange(e);}}
@@ -495,13 +778,13 @@ export default function AddonsConfigPage() {
 						<div
 							id="TurboInputOptions"
 							hidden={!values.TurboInputEnabled}>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Turbo Pin"
 								name="turboPin"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.turboPin}
+								value={values.turboPin || -1}
 								error={errors.turboPin}
 								isInvalid={errors.turboPin}
 								onChange={handleChange}
@@ -513,7 +796,7 @@ export default function AddonsConfigPage() {
 								name="turboPinLED"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.turboPinLED}
+								value={values.turboPinLED || -1}
 								error={errors.turboPinLED}
 								isInvalid={errors.turboPinLED}
 								onChange={handleChange}
@@ -537,7 +820,7 @@ export default function AddonsConfigPage() {
 								name="pinShmupDial"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.pinShmupDial}
+								value={values.pinShmupDial || -1}
 								error={errors.pinShmupDial}
 								isInvalid={errors.pinShmupDial}
 								onChange={handleChange}
@@ -549,8 +832,6 @@ export default function AddonsConfigPage() {
 								type="switch"
 								id="ShmupMode"
 								className="col-sm-3 ms-2"
-								groupClassName="col-sm-3 mb-3"
-								error={false}
 								isInvalid={false}
 								checked={Boolean(values.shmupMode)}
 								onChange={(e) => {handleCheckbox("shmupMode", values); handleChange(e);}}
@@ -558,7 +839,7 @@ export default function AddonsConfigPage() {
 							<div
 								id="ShmupOptions"
 								hidden={!values.shmupMode}>
-								<Row class="mb-3">
+								<Row className="mb-3">
 									<FormSelect
 										label="Turbo Always On 1"
 										name="shmupAlwaysOn1"
@@ -608,7 +889,7 @@ export default function AddonsConfigPage() {
 										{TURBO_MASKS.map((o, i) => <option key={`shmupAlwaysOn4-option-${i}`} value={o.value}>{o.label}</option>)}
 									</FormSelect>
 								</Row>
-								<Row class="mb-3">
+								<Row className="mb-3">
 									<FormControl type="number"
 										label="Charge Button 1 Pin"
 										name="pinShmupBtn1"
@@ -658,7 +939,7 @@ export default function AddonsConfigPage() {
 										max={29}
 									/>
 								</Row>
-								<Row class="mb-3">
+								<Row className="mb-3">
 									<FormSelect
 										label="Charge Button 1 Assignment"
 										name="shmupBtnMask1"
@@ -673,7 +954,7 @@ export default function AddonsConfigPage() {
 									</FormSelect>
 									<FormSelect
 										label="Charge Button 2 Assignment"
-										name="shmupBtnMask1"
+										name="shmupBtnMask2"
 										className="form-select-sm"
 										groupClassName="col-sm-3 mb-3"
 										value={values.shmupBtnMask2}
@@ -685,7 +966,7 @@ export default function AddonsConfigPage() {
 									</FormSelect>
 									<FormSelect
 										label="Charge Button 3 Assignment"
-										name="shmupBtnMask1"
+										name="shmupBtnMask3"
 										className="form-select-sm"
 										groupClassName="col-sm-3 mb-3"
 										value={values.shmupBtnMask3}
@@ -697,7 +978,7 @@ export default function AddonsConfigPage() {
 									</FormSelect>
 									<FormSelect
 										label="Charge Button 4 Assignment"
-										name="shmupBtnMask1"
+										name="shmupBtnMask4"
 										className="form-select-sm"
 										groupClassName="col-sm-3 mb-3"
 										value={values.shmupBtnMask4}
@@ -727,8 +1008,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="TurboInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.TurboInputEnabled)}
 							onChange={(e) => {handleCheckbox("TurboInputEnabled", values); handleChange(e);}}
@@ -738,7 +1018,7 @@ export default function AddonsConfigPage() {
 						<div
 							id="JSliderInputOptions"
 							hidden={!values.JSliderInputEnabled}>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Slider LS Pin"
 								name="sliderLSPin"
@@ -769,8 +1049,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="JSliderInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.JSliderInputEnabled)}
 							onChange={(e) => {handleCheckbox("JSliderInputEnabled", values); handleChange(e);}}
@@ -780,7 +1059,7 @@ export default function AddonsConfigPage() {
 						<div
 							id="ReverseInputOptions"
 							hidden={!values.ReverseInputEnabled}>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Reverse Input Pin"
 								name="reversePin"
@@ -806,7 +1085,7 @@ export default function AddonsConfigPage() {
 								max={29}
 							/>
 						</Row>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormSelect
 								label="Reverse Up"
 								name="reverseActionUp"
@@ -861,8 +1140,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="ReverseInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.ReverseInputEnabled)}
 							onChange={(e) => {handleCheckbox("ReverseInputEnabled", values); handleChange(e);}}
@@ -872,7 +1150,7 @@ export default function AddonsConfigPage() {
 						<div
 							id="I2CAnalog1219InputOptions"
 							hidden={!values.I2CAnalog1219InputEnabled}>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="I2C Analog ADS1219 SDA Pin"
 								name="i2cAnalog1219SDAPin"
@@ -921,7 +1199,7 @@ export default function AddonsConfigPage() {
 								min={100000}
 							/>
 						</Row>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl
 								label="I2C Analog ADS1219 Address"
 								name="i2cAnalog1219Address"
@@ -939,8 +1217,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="I2CAnalog1219InputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.I2CAnalog1219InputEnabled)}
 							onChange={(e) => {handleCheckbox("I2CAnalog1219InputEnabled", values); handleChange(e);}}
@@ -1050,13 +1327,13 @@ export default function AddonsConfigPage() {
 						<div
 							id="DualDirectionalInputOptions"
 							hidden={!values.DualDirectionalInputEnabled}>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Dual Up Pin"
 								name="dualDirUpPin"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.dualDirUpPin}
+								value={values.dualDirUpPin || -1}
 								error={errors.dualDirUpPin}
 								isInvalid={errors.dualDirUpPin}
 								onChange={handleChange}
@@ -1068,7 +1345,7 @@ export default function AddonsConfigPage() {
 								name="dualDirDownPin"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.dualDirDownPin}
+								value={values.dualDirDownPin || -1}
 								error={errors.dualDirDownPin}
 								isInvalid={errors.dualDirDownPin}
 								onChange={handleChange}
@@ -1080,7 +1357,7 @@ export default function AddonsConfigPage() {
 								name="dualDirLeftPin"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.dualDirLeftPin}
+								value={values.dualDirLeftPin || -1}
 								error={errors.dualDirLeftPin}
 								isInvalid={errors.dualDirLeftPin}
 								onChange={handleChange}
@@ -1092,7 +1369,7 @@ export default function AddonsConfigPage() {
 								name="dualDirRightPin"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.dualDirRightPin}
+								value={values.dualDirRightPin || -1}
 								error={errors.dualDirRightPin}
 								isInvalid={errors.dualDirRightPin}
 								onChange={handleChange}
@@ -1100,7 +1377,7 @@ export default function AddonsConfigPage() {
 								max={29}
 							/>
 						</Row>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormSelect
 								label="Dual D-Pad Mode"
 								name="dualDirDpadMode"
@@ -1132,8 +1409,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="DualDirectionalInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.DualDirectionalInputEnabled)}
 							onChange={(e) => {handleCheckbox("DualDirectionalInputEnabled", values); handleChange(e);}}
@@ -1143,7 +1419,7 @@ export default function AddonsConfigPage() {
 						<div
 							id="BuzzerSpeakerAddonOptions"
 							hidden={!values.BuzzerSpeakerAddonEnabled}>
-						<Row class="mb-3">	
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Buzzer Pin"
 								name="buzzerPin"
@@ -1174,8 +1450,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="BuzzerSpeakerAddonButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.BuzzerSpeakerAddonEnabled)}
 							onChange={(e) => {handleCheckbox("BuzzerSpeakerAddonEnabled", values); handleChange(e);}}
@@ -1185,13 +1460,13 @@ export default function AddonsConfigPage() {
 						<div
 							id="ExtraButtonAddonOptions"
 							hidden={!values.ExtraButtonAddonEnabled}>
-							<Row class="mb-3">
+							<Row className="mb-3">
 								<FormControl type="number"
 									label="Extra Button Pin"
 									name="extraButtonPin"
 									className="form-select-sm"
 									groupClassName="col-sm-3 mb-3"
-									value={values.extraButtonPin}
+									value={values.extraButtonPin || -1}
 									error={errors.extraButtonPin}
 									isInvalid={errors.extraButtonPin}
 									onChange={handleChange}
@@ -1216,8 +1491,7 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="ExtraButtonAddonButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.ExtraButtonAddonEnabled)}
 							onChange={(e) => { handleCheckbox("ExtraButtonAddonEnabled", values); handleChange(e);}}
@@ -1228,7 +1502,7 @@ export default function AddonsConfigPage() {
 							id="PlayerNumAddonOptions"
 							hidden={!values.PlayerNumAddonEnabled}>
 						<p><strong>WARNING: ONLY ENABLE THIS OPTION IF YOU ARE CONNECTING MULTIPLE GP2040-CE DEVICES WITH PLAYER NUMBER ENABLED</strong></p>
-						<Row class="mb-3">
+						<Row className="mb-3">
 							<FormControl type="number"
 								label="Player Number"
 								name="playerNumber"
@@ -1247,38 +1521,74 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="PlayerNumAddonButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.PlayerNumAddonEnabled)}
 							onChange={(e) => {handleCheckbox("PlayerNumAddonEnabled", values); handleChange(e);}}
 						/>
 					</Section>
-					<Section title="SOCD Selection Slider">
+					<Section title="SOCD Cleaning Mode Selection Slider">
+						<p>Note: PS4, PS3 and Nintendo Switch modes do not support setting SOCD Cleaning to Off and will default to Neutral SOCD Cleaning mode.</p>
 						<div
 							id="SliderSOCDInputOptions"
 							hidden={!values.SliderSOCDInputEnabled}>
-						<Row class="mb-3">
-							<FormControl type="number"
-								label="Slider SOCD Up Priority Pin"
-								name="sliderSOCDUpPin"
+						<Row className="mb-3">
+							<FormSelect
+								label="SOCD Slider Mode Default"
+								name="sliderSOCDModeDefault"
 								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.sliderSOCDUpPin}
-								error={errors.sliderSOCDUpPin}
-								isInvalid={errors.sliderSOCDUpPin}
+								value={values.sliderSOCDModeDefault}
+								error={errors.sliderSOCDModeDefault}
+								isInvalid={errors.sliderSOCDModeDefault}
+								onChange={handleChange}
+							>
+								{SOCD_MODES.map((o, i) => <option key={`sliderSOCDModeDefault-option-${i}`} value={o.value}>{o.label}</option>)}
+							</FormSelect>
+							<FormSelect
+								label="SOCD Slider Mode One"
+								name="sliderSOCDModeOne"
+								className="form-select-sm"
+								groupClassName="col-sm-3 mb-3"
+								value={values.sliderSOCDModeOne}
+								error={errors.sliderSOCDModeOne}
+								isInvalid={errors.sliderSOCDModeOne}
+								onChange={handleChange}
+							>
+								{SOCD_MODES.map((o, i) => <option key={`sliderSOCDModeOne-option-${i}`} value={o.value}>{o.label}</option>)}
+							</FormSelect>
+							<FormControl type="number"
+								label="Pin One"
+								name="sliderSOCDPinOne"
+								className="form-select-sm"
+								groupClassName="col-sm-1 mb-3"
+								value={values.sliderSOCDPinOne}
+								error={errors.sliderSOCDPinOne}
+								isInvalid={errors.sliderSOCDPinOne}
 								onChange={handleChange}
 								min={-1}
 								max={29}
 							/>
-							<FormControl type="number"
-								label="Slider SOCD Second Input Priority Pin"
-								name="sliderSOCDSecondPin"
-								className="form-control-sm"
+							<FormSelect
+								label="SOCD Slider Mode Two"
+								name="sliderSOCDModeTwo"
+								className="form-select-sm"
 								groupClassName="col-sm-3 mb-3"
-								value={values.sliderSOCDSecondPin}
-								error={errors.sliderSOCDSecondPin}
-								isInvalid={errors.sliderSOCDSecondPin}
+								value={values.sliderSOCDModeTwo}
+								error={errors.sliderSOCDModeTwo}
+								isInvalid={errors.sliderSOCDModeTwo}
+								onChange={handleChange}
+							>
+								{SOCD_MODES.map((o, i) => <option key={`sliderSOCDModeTwo-option-${i}`} value={o.value}>{o.label}</option>)}
+							</FormSelect>
+							<FormControl type="number"
+								label="Pin Two"
+								name="sliderSOCDPinTwo"
+								className="form-control-sm"
+								groupClassName="col-sm-1 mb-3"
+								value={values.sliderSOCDPinTwo}
+								error={errors.sliderSOCDPinTwo}
+								isInvalid={errors.sliderSOCDPinTwo}
 								onChange={handleChange}
 								min={-1}
 								max={29}
@@ -1289,18 +1599,132 @@ export default function AddonsConfigPage() {
 							label="Enabled"
 							type="switch"
 							id="SliderSOCDInputButton"
-							reverse="true"
-							error={false}
+							reverse
 							isInvalid={false}
 							checked={Boolean(values.SliderSOCDInputEnabled)}
 							onChange={(e) => {handleCheckbox("SliderSOCDInputEnabled", values); handleChange(e);}}
 						/>
 					</Section>
+					<Section title="PS4 Mode">
+						<div
+							id="PS4ModeOptions"
+							hidden={!values.PS4ModeAddonEnabled}>
+							<Row>
+								<h2>!!!! DISCLAIMER: GP2040-CE WILL NEVER SUPPLY THESE FILES !!!!</h2>
+								<p>Please upload the 3 required files and click the "Verify & Save" button to use PS4 Mode.</p>
+							</Row>
+							<Row className="mb-3">
+								<div className="col-sm-3 mb-3">
+									Private Key (PEM):
+									<input type="file" id="ps4key-input" accept="*/*" />
+								</div>
+								<div className="col-sm-3 mb-3">
+									Serial Number (16 Bytes in Hex Ascii):
+									<input type="file" id="ps4serial-input" accept="*/*" />
+								</div>
+								<div className="col-sm-3 mb-3">
+									Signature (256 Bytes in Binary):
+									<input type="file" id="ps4signature-input" accept="*/*" />
+								</div>
+							</Row>
+							<Row className="mb-3">
+								<div className="col-sm-3 mb-3">
+									<Button type="button" onClick={verifyAndSavePS4}>Verify & Save</Button>
+								</div>
+							</Row>
+							<Row className="mb-3">
+								<div className="col-sm-3 mb-3">
+									<span id="ps4alert"></span>
+								</div>
+							</Row>
+						</div>
+						<FormCheck
+							label="Enabled"
+							type="switch"
+							id="PS4ModeAddonEnabledButton"
+							reverse
+							isInvalid={false}
+							checked={Boolean(values.PS4ModeAddonEnabled)}
+							onChange={(e) => {handleCheckbox("PS4ModeAddonEnabled", values); handleChange(e);}}
+						/>
+					</Section>
+					<Section title="Wii Extension Configuration">
+						<div
+							id="WiiExtensionAddonOptions"
+							hidden={!values.WiiExtensionAddonEnabled}>
+							<Row>
+								<p>Note: If the Display is enabled at the same time, this Addon will be disabled.</p>
+                                <h3>Currently Supported Controllers</h3>
+                                <p>Classic/Classic Pro: Both Analogs and D-Pad Supported. B = B1, A = B2, Y = B3, X = B4, L = L1, ZL = L2, R = R1, ZR = R2, Minus = S1, Plus = S2, Home = A1</p>
+                                <p>Nunchuck: Analog Stick Supported. C = B1, Z = B2</p>
+                                <p>Guitar Hero Guitar: Analog Stick Supported. Green = B1, Red = B2, Blue = B3, Yellow = B4, Orange = L1, Strum Up = Up, Strum Down = Down, Minus = S1, Plus = S2</p>
+							</Row>
+							<Row className="mb-3">
+								<FormControl type="number"
+									label="I2C SDA Pin"
+									name="wiiExtensionSDAPin"
+									className="form-control-sm"
+									groupClassName="col-sm-3 mb-3"
+									value={values.wiiExtensionSDAPin}
+									error={errors.wiiExtensionSDAPin}
+									isInvalid={errors.wiiExtensionSDAPin}
+									onChange={handleChange}
+									min={-1}
+									max={29}
+								/>
+								<FormControl type="number"
+									label="I2C SCL Pin"
+									name="wiiExtensionSCLPin"
+									className="form-select-sm"
+									groupClassName="col-sm-3 mb-3"
+									value={values.wiiExtensionSCLPin}
+									error={errors.wiiExtensionSCLPin}
+									isInvalid={errors.wiiExtensionSCLPin}
+									onChange={handleChange}
+									min={-1}
+									max={29}
+								/>
+								<FormSelect
+									label="I2C Block"
+									name="wiiExtensionBlock"
+									className="form-select-sm"
+									groupClassName="col-sm-3 mb-3"
+									value={values.wiiExtensionBlock}
+									error={errors.wiiExtensionBlock}
+									isInvalid={errors.wiiExtensionBlock}
+									onChange={handleChange}
+								>
+									{I2C_BLOCKS.map((o, i) => <option key={`wiiExtensionI2cBlock-option-${i}`} value={o.value}>{o.label}</option>)}
+								</FormSelect>
+								<FormControl
+									label="I2C Speed"
+									name="wiiExtensionSpeed"
+									className="form-control-sm"
+									groupClassName="col-sm-3 mb-3"
+									value={values.wiiExtensionSpeed}
+									error={errors.wiiExtensionSpeed}
+									isInvalid={errors.wiiExtensionSpeed}
+									onChange={handleChange}
+									min={100000}
+								/>
+							</Row>
+						</div>
+						<FormCheck
+							label="Enabled"
+							type="switch"
+							id="WiiExtensionButton"
+							reverse="true"
+							error={undefined}
+							isInvalid={false}
+							checked={Boolean(values.WiiExtensionAddonEnabled)}
+							onChange={(e) => {handleCheckbox("WiiExtensionAddonEnabled", values); handleChange(e);}}
+						/>
+					</Section>
 					<div className="mt-3">
-						<Button type="submit">Save</Button>
+						<Button type="submit" id="save">Save</Button>
 						{saveMessage ? <span className="alert">{saveMessage}</span> : null}
 					</div>
-					<FormContext />
+					<FormContext setStoredData={setStoredData}/>
 				</Form>
 			)}
 		</Formik>

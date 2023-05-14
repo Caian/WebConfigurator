@@ -1,16 +1,19 @@
 import React, { useState } from 'react';
-import { BrowserRouter as Router, Route, Switch } from "react-router-dom";
+import { BrowserRouter as Router, Route, Routes } from "react-router-dom";
 import { AppContext } from './Contexts/AppContext';
 import Navigation from './Components/Navigation'
 
 import HomePage from './Pages/HomePage'
 import PinMappingPage from "./Pages/PinMapping";
+import KeyboardMappingPage from "./Pages/KeyboardMapping";
 import ResetSettingsPage from './Pages/ResetSettingsPage';
 import SettingsPage from './Pages/SettingsPage';
 import DisplayConfigPage from './Pages/DisplayConfig';
 import LEDConfigPage from './Pages/LEDConfigPage';
+import CustomThemePage from './Pages/CustomThemePage';
 import AddonsConfigPage from './Pages/AddonsConfigPage';
 import BackupPage from './Pages/BackupPage';
+import PlaygroundPage from './Pages/PlaygroundPage';
 
 import { loadButtonLabels } from './Services/Storage';
 import './App.scss';
@@ -28,32 +31,19 @@ const App = () => {
 			<Router>
 				<Navigation />
 				<div className="container-fluid body-content">
-					<Switch>
-						<Route exact path="/">
-							<HomePage />
-						</Route>
-						<Route path="/settings">
-							<SettingsPage />
-						</Route>
-						<Route path="/pin-mapping">
-							<PinMappingPage />
-						</Route>
-						<Route path="/reset-settings">
-							<ResetSettingsPage />
-						</Route>
-						<Route path="/led-config">
-							<LEDConfigPage />
-						</Route>
-						<Route path="/display-config">
-							<DisplayConfigPage />
-						</Route>
-						<Route path="/add-ons">
-							<AddonsConfigPage />
-						</Route>
-						<Route path="/backup">
-							<BackupPage />
-						</Route>
-					</Switch>
+					<Routes>
+						<Route path="/" element={<HomePage />} />
+						<Route path="/settings" element={<SettingsPage />} />
+						<Route path="/pin-mapping" element={<PinMappingPage />} />
+						<Route path="/keyboard-mapping" element={<KeyboardMappingPage />} />
+            <Route path="/reset-settings" element={<ResetSettingsPage />} />
+						<Route path="/led-config" element={<LEDConfigPage />} />
+						<Route path="/custom-theme" element={<CustomThemePage />} />
+						<Route path="/display-config" element={<DisplayConfigPage />} />
+						<Route path="/add-ons" element={<AddonsConfigPage />} />
+						<Route path="/backup" element={<BackupPage />} />
+						<Route path="/playground" element={<PlaygroundPage />} />
+					</Routes>
 				</div>
 			</Router>
 		</AppContext.Provider>
